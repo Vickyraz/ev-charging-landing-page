@@ -1,5 +1,5 @@
 {
-  "name": "ocpp-sim-landing-page",
+  "name": "ev-charging-display",
   "private": true,
   "version": "0.1.0",
   "type": "module",

@@ -1,5 +1,5 @@
 /**
- * EVScene — reusable Three.js scene for the OCPP EVSE Simulator.
+ * EVScene — reusable Three.js scene for the EV Charging Display.
  *
  * mode="intro"  : full-screen cinematic intro with auto demo loop
  * mode="panel"  : compact panel driven by live snapshot + log
@@ -8,6 +8,7 @@ import { useRef, useState, useEffect, useMemo } from 'react'
 import { Canvas, useFrame } from '@react-three/fiber'
 import { Environment, RoundedBox, Text } from '@react-three/drei'
 import * as THREE from 'three'
+import Car, { CAR_VARIANTS } from './Car'
 
 // ─── Easing helpers ───────────────────────────────────────────────────────────
 const easeOutCubic = t => 1 - Math.pow(1 - t, 3)
@@ -23,28 +24,6 @@ const spring = (current, target, velocity, stiffness = 150, damping = 18, dt = 0
   const newVel = velocity + force * dt
   const newPos = current + newVel * dt
   return [newPos, newVel]
-}
-
-// Unity-style critically-damped SmoothDamp — buttery arrival, no overshoot snap.
-// velRef is a mutable ref holding current velocity; returns the new position.
-const smoothDamp = (current, target, velRef, smoothTime, dt, maxSpeed = Infinity) => {
-  smoothTime = Math.max(0.0001, smoothTime)
-  const omega = 2 / smoothTime
-  const x = omega * dt
-  const exp = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x)
-  const maxChange = maxSpeed * smoothTime
-  let change = current - target
-  change = Math.max(-maxChange, Math.min(change, maxChange))
-  const originalTo = target
-  const tgt = current - change
-  const temp = (velRef.current + omega * change) * dt
-  velRef.current = (velRef.current - omega * temp) * exp
-  let output = tgt + (change + temp) * exp
-  if ((originalTo - current > 0) === (output > originalTo)) {
-    output = originalTo
-    velRef.current = (output - originalTo) / dt
-  }
-  return output
 }
 
 // Procedural window textures for cityscape buildings.
@@ -93,63 +72,10 @@ const PORT_LOCAL = { x: 1.0, y: 0.48, z: 0.48 }
 const CHARGER_Z   = 1.05
 // EVSE cable outlet (world); follows the charger's +Z offset
 const EVSE_OUTLET = { x: 0.21, y: 0.96, z: CHARGER_Z + 0.13 }
-// CSMS (Ford building) set back behind the charging station, clear of the loop
 const CSMS_GROUND = [5.0, 0, -6.8]
 const CSMS_SCALE  = 2.0
 // Message-packet endpoint near the building's lower front
 const CSMS_LINK   = new THREE.Vector3(4.6, 1.9, -5.4)
-
-// ─── Drive path (intro) ───────────────────────────────────────────────────────
-// Open path (no longer a loop): a fresh car enters from the far left, approaches
-// the charging pad heading EAST so its front charge-port faces the EVSE. After
-// charging it pulls forward (east), turns left to head north, drives straight
-// past the Ford building and up between the building gaps, and vanishes. Next
-// cycle a new car arrives.
-const PAD_POINT = new THREE.Vector3(-1.8, 0, 0.0)   // charging pad, heading east
-
-const ENTRY_POINTS = [
-  new THREE.Vector3(-18.5, 0, -2.5),   // far left, off-screen among buildings
-  new THREE.Vector3( -7.5, 0, -1.6),
-  new THREE.Vector3( -5.6, 0, -0.6),   // curve onto the near lane
-  new THREE.Vector3( -4.6, 0,  0.0),   // settle onto z=0 lane, heading east
-  PAD_POINT.clone(),                   // arrive at pad heading east
-]
-const EXIT_POINTS = [
-  PAD_POINT.clone(),                   // depart the pad heading east
-  new THREE.Vector3(  1.2, 0,  0.0),   // pull forward (east)
-  new THREE.Vector3(  2.9, 0, -1.3),   // turn left → north
-  new THREE.Vector3(  3.3, 0, -4.5),   // north, passing left of the Ford office
-  new THREE.Vector3(  3.3, 0, -9.0),
-  new THREE.Vector3(  3.2, 0, -16.0),  // between the building gaps
-  new THREE.Vector3(  3.2, 0, -26.0),  // vanish into the distance
-  new THREE.Vector3(  2.2, 0, -36.0),  // vanish into the distance
-  new THREE.Vector3(  0, 0, -46.0),  // vanish into the distance
-]
-const ENTRY_CURVE = new THREE.CatmullRomCurve3(ENTRY_POINTS, false, 'centripetal', 0.5)
-const EXIT_CURVE  = new THREE.CatmullRomCurve3(EXIT_POINTS,  false, 'centripetal', 0.5)
-const ENTRY_LEN   = ENTRY_CURVE.getLength()
-const EXIT_LEN    = EXIT_CURVE.getLength()
-// Pause (seconds) after the car stops at the pad before the connector plugs in
-const CONNECT_DELAY = 2
-
-// Shortest-arc angle interpolation (handles ±π wrap)
-const lerpAngle = (a, b, t) => {
-  let d = (b - a) % (Math.PI * 2)
-  if (d > Math.PI)  d -= Math.PI * 2
-  if (d < -Math.PI) d += Math.PI * 2
-  return a + d * t
-}
-
-// Truck colour variants — a fresh car arrives at the pad each charging session
-const CAR_VARIANTS = [
-  { body: '#2f6fc4' },   // Atlas blue
-  { body: '#c0392b' },   // racing red
-  { body: '#c3c8ce' },   // silver
-  { body: '#10243f' },   // midnight navy
-  { body: '#e9ebee' },   // oxford white
-  { body: '#2e7d52' },   // forest green
-  { body: '#e0902f' },   // amber orange
-]
 
 // ─── Ground ───────────────────────────────────────────────────────────────────
 function Ground({ chargingPad }) {
@@ -188,357 +114,6 @@ function Ground({ chargingPad }) {
         <pointLight position={[-1.8, 0.1, 0]} color="#0ea5e9" intensity={2} distance={2.5} />
       )}
     </>
-  )
-}
-
-// ─── Car (Ford F-150 Lightning — composite volume build) ──────────────────────
-function Car({ mode, phase, state, carXRef, variant, onNewCar, onArrived, onExited, onParked }) {
-  const groupRef   = useRef()
-  const wheelRefs  = useRef([])
-  const velRef     = useRef(0)                          // panel x velocity (smoothDamp)
-  const uRef       = useRef(0)                          // intro path progress 0..1
-  const uVelRef    = useRef(0)
-  const posRef     = useRef(new THREE.Vector3(-7, 0, 0))
-  const headRef    = useRef(0)                          // smoothed heading (rad)
-  const steerRef   = useRef(0)                          // front-wheel steer
-  const bobRef     = useRef(0)
-  const phaseRef   = useRef(null)
-  const doneRef    = useRef(false)                      // arrived/exited reported?
-  const stopTimerRef = useRef(0)                        // dwell after car stops
-  const panelParkRef = useRef(false)                    // panel: car settled at pad?
-
-  const isCharging  = state === 'Charging'
-  const isConnected = state === 'Occupied' || isCharging
-
-  // ── Scale constants ────────────────────────────────────────────────────────
-  const GND = 0.18   // ground clearance
-  const WR  = 0.24   // wheel radius (truck-sized)
-  const TW  = 0.94   // body width (Z)
-
-  // ── Key longitudinal landmarks (X: front = +X) ──────────────────────────────
-  const FRONT   =  1.18   // front bumper face
-  const REAR    = -1.18   // rear bumper face
-  const HOOD_X0 =  0.52   // hood / cab split
-  const CAB_X1  = -0.34   // cab / bed split
-  const BELT    = GND + 0.42   // beltline (top of doors / hood height)
-  const ROOF    = GND + 0.80   // roof height
-  const BED_TOP = GND + 0.40   // bed wall height
-
-  const BODY_COLOR  = variant?.body ?? '#2f6fc4'   // per-lap truck colour
-  const TRIM_BLACK  = '#0b1220'
-  const GLASS_COLOR = '#0e1c2b'
-
-  const bodyMat  = { color: BODY_COLOR, metalness: 0.7, roughness: 0.22, envMapIntensity: 1.3 }
-  const glassMat = { color: GLASS_COLOR, transparent: true, opacity: 0.55, metalness: 0.2, roughness: 0.05 }
-
-  // ── Movement ───────────────────────────────────────────────────────────────
-  // intro: open path — enter from far right → park at pad (charge) → exit north
-  // panel: ease along x to/from the pad based on connection state
-  useFrame((_, dt) => {
-    if (!groupRef.current) return
-    const g = groupRef.current
-    let px, pz, heading, speed = 0
-
-    if (mode === 'intro') {
-      // phase changes: arriving = drive entry curve (new car), leaving = exit curve
-      if (phase !== phaseRef.current) {
-        if (phase === 'arriving') {
-          uRef.current = 0; uVelRef.current = 0; doneRef.current = false; stopTimerRef.current = 0
-          if (onNewCar) onNewCar()           // swap to the next car off-screen
-        } else if (phase === 'leaving') {
-          uRef.current = 0; uVelRef.current = 0; doneRef.current = false
-        }
-        phaseRef.current = phase
-      }
-      let curve, len
-      if (phase === 'arriving') {
-        curve = ENTRY_CURVE; len = ENTRY_LEN
-        uRef.current = smoothDamp(uRef.current, 1, uVelRef, 0.6, dt, 0.34)
-        // wait a short beat after the car has stopped, then connect
-        if (uRef.current > 0.97 && Math.abs(uVelRef.current) < 0.02) {
-          stopTimerRef.current += dt
-          if (!doneRef.current && stopTimerRef.current >= CONNECT_DELAY) {
-            doneRef.current = true
-            if (onArrived) onArrived()
-          }
-        } else {
-          stopTimerRef.current = 0
-        }
-      } else if (phase === 'leaving') {
-        curve = EXIT_CURVE; len = EXIT_LEN
-        uRef.current = smoothDamp(uRef.current, 1, uVelRef, 0.9, dt, 0.3)
-        // vanished into the fog → immediately start the next car's arrival
-        if (!doneRef.current && uRef.current > 0.97) {
-          doneRef.current = true
-          if (onExited) onExited()
-        }
-      } else {
-        curve = ENTRY_CURVE; len = ENTRY_LEN
-        // ease the final sliver to the exact pad (no snap), then hold
-        uRef.current = smoothDamp(uRef.current, 1, uVelRef, 0.4, dt, 0.6)
-      }
-      const u   = THREE.MathUtils.clamp(uRef.current, 0, 1)
-      const pt  = curve.getPointAt(u)
-      const tan = curve.getTangentAt(u)
-      px = pt.x; pz = pt.z
-      heading = Math.atan2(-tan.z, tan.x)
-      speed   = uVelRef.current * len
-    } else {
-      const connected = state === 'Occupied' || state === 'Charging'
-      const targetX = connected ? -1.8 : -7
-      const prev = posRef.current.x
-      px = smoothDamp(prev, targetX, velRef, 0.9, dt, 12)
-      pz = 0
-      heading = 0
-      speed = (px - prev) / Math.max(dt, 0.001)
-      // report parked state so the cable only attaches once the car has settled
-      const parked = connected && Math.abs(px - (-1.8)) < 0.06
-      if (onParked && parked !== panelParkRef.current) {
-        panelParkRef.current = parked
-        onParked(parked)
-      }
-    }
-
-    // Heading (smoothed, shortest-arc)
-    const prevHead = headRef.current
-    headRef.current = lerpAngle(prevHead, heading, 1 - Math.exp(-dt * 9))
-    const angVel = (headRef.current - prevHead) / Math.max(dt, 0.001)
-
-    g.position.x = px
-    g.position.z = pz
-    g.rotation.y = headRef.current
-
-    // Lean into turns; settle bob when parked
-    const targetRoll = THREE.MathUtils.clamp(-angVel * 0.06, -0.05, 0.05)
-    g.rotation.z = THREE.MathUtils.lerp(g.rotation.z, targetRoll, dt * 6)
-    if (Math.abs(speed) < 0.05) {
-      bobRef.current += dt * 3
-      g.position.y = Math.sin(bobRef.current) * 0.004 * Math.exp(-bobRef.current * 0.25)
-      if (bobRef.current > 6) bobRef.current = 0
-    } else {
-      bobRef.current = 0
-      g.position.y = 0
-    }
-
-    posRef.current.set(px, 0, pz)
-    if (carXRef) carXRef.current = px
-
-    // Wheels: roll about the axle (Z); front pair steers about vertical (Y)
-    const dTheta = (speed * dt) / WR
-    const targetSteer = THREE.MathUtils.clamp(angVel * 0.20, -0.5, 0.5)
-    steerRef.current = THREE.MathUtils.lerp(steerRef.current, targetSteer, dt * 8)
-    wheelRefs.current.forEach((r, i) => {
-      if (!r) return
-      r.rotation.z -= dTheta
-      r.rotation.y = i < 2 ? steerRef.current : 0
-    })
-  })
-
-  const WHEEL_POSITIONS = [
-    [ 0.72, WR,  TW / 2 + 0.03], [ 0.72, WR, -(TW / 2 + 0.03)],
-    [-0.78, WR,  TW / 2 + 0.03], [-0.78, WR, -(TW / 2 + 0.03)],
-  ]
-
-  // Helper for box centers/sizes from x-range
-  const span = (x0, x1, y0, y1, z = TW) => ({
-    pos:  [(x0 + x1) / 2, (y0 + y1) / 2, 0],
-    args: [Math.abs(x1 - x0), Math.abs(y1 - y0), z],
-  })
-
-  const lowerBody = span(REAR, FRONT, GND + 0.02, GND + 0.24)
-  const hood      = span(HOOD_X0, FRONT - 0.02, GND + 0.24, GND + 0.40)
-  const cabLower  = span(CAB_X1, HOOD_X0, GND + 0.24, BELT)
-  const bedFloor  = span(REAR + 0.04, CAB_X1, GND + 0.24, BED_TOP)
-
-  return (
-      <group ref={groupRef}>
-
-        {/* ── Lower body / chassis (full length) ──────────────────────────── */}
-        <mesh position={lowerBody.pos} castShadow>
-          <boxGeometry args={lowerBody.args} />
-          <meshStandardMaterial {...bodyMat} />
-        </mesh>
-
-        {/* ── Hood / front clip (lower than cab) ──────────────────────────── */}
-        <mesh position={hood.pos} castShadow>
-          <RoundedBox args={hood.args} radius={0.04} smoothness={4}>
-            <meshStandardMaterial {...bodyMat} />
-          </RoundedBox>
-        </mesh>
-
-        {/* ── Cab lower (doors region up to beltline) ─────────────────────── */}
-        <mesh position={cabLower.pos} castShadow>
-          <boxGeometry args={cabLower.args} />
-          <meshStandardMaterial {...bodyMat} />
-        </mesh>
-
-        {/* ── Crew-cab greenhouse (glass box, inset) ──────────────────────── */}
-        <mesh position={[(CAB_X1 + HOOD_X0) / 2, (BELT + ROOF) / 2, 0]} castShadow>
-          <RoundedBox args={[Math.abs(HOOD_X0 - CAB_X1) - 0.06, ROOF - BELT, TW - 0.10]} radius={0.05} smoothness={4}>
-            <meshStandardMaterial {...glassMat} side={THREE.DoubleSide} />
-          </RoundedBox>
-        </mesh>
-
-        {/* ── Roof cap (body-color, sits on greenhouse) ───────────────────── */}
-        <mesh position={[(CAB_X1 + HOOD_X0) / 2 + 0.02, ROOF, 0]} castShadow>
-          <RoundedBox args={[Math.abs(HOOD_X0 - CAB_X1) - 0.10, 0.05, TW - 0.06]} radius={0.025} smoothness={4}>
-            <meshStandardMaterial {...bodyMat} />
-          </RoundedBox>
-        </mesh>
-
-        {/* ── A & C pillars + door split (subtle body-color posts) ─────────── */}
-        {[TW / 2 - 0.02, -(TW / 2 - 0.02)].map((z, i) => (
-            <group key={i}>
-              {/* A-pillar */}
-              <mesh position={[HOOD_X0 - 0.04, (BELT + ROOF) / 2, z]} rotation={[0, 0, 0.20]}>
-                <boxGeometry args={[0.05, ROOF - BELT + 0.04, 0.03]} />
-                <meshStandardMaterial {...bodyMat} />
-              </mesh>
-              {/* B-pillar */}
-              <mesh position={[0.10, (BELT + ROOF) / 2, z]}>
-                <boxGeometry args={[0.045, ROOF - BELT, 0.03]} />
-                <meshStandardMaterial color={TRIM_BLACK} metalness={0.4} roughness={0.5} />
-              </mesh>
-              {/* C-pillar */}
-              <mesh position={[CAB_X1 + 0.04, (BELT + ROOF) / 2, z]} rotation={[0, 0, -0.12]}>
-                <boxGeometry args={[0.06, ROOF - BELT + 0.04, 0.03]} />
-                <meshStandardMaterial {...bodyMat} />
-              </mesh>
-            </group>
-        ))}
-
-        {/* ── Bed walls (open-top box behind cab) ─────────────────────────── */}
-        {[TW / 2 - 0.05, -(TW / 2 - 0.05)].map((z, i) => (
-            <mesh key={i} position={[(REAR + CAB_X1) / 2, (GND + 0.24 + BED_TOP) / 2, z]} castShadow>
-              <boxGeometry args={[Math.abs(CAB_X1 - REAR) - 0.04, BED_TOP - (GND + 0.24), 0.06]} />
-              <meshStandardMaterial {...bodyMat} />
-            </mesh>
-        ))}
-        {/* Bed front wall (against cab) */}
-        <mesh position={[CAB_X1 - 0.02, (GND + 0.24 + BED_TOP) / 2, 0]}>
-          <boxGeometry args={[0.05, BED_TOP - (GND + 0.24), TW - 0.10]} />
-          <meshStandardMaterial {...bodyMat} />
-        </mesh>
-        {/* Bed inner floor (dark liner) */}
-        <mesh position={[(REAR + CAB_X1) / 2, GND + 0.245, 0]}>
-          <boxGeometry args={[Math.abs(CAB_X1 - REAR) - 0.06, 0.02, TW - 0.14]} />
-          <meshStandardMaterial color={TRIM_BLACK} roughness={0.85} metalness={0.1} />
-        </mesh>
-
-        {/* ── Tonneau cover (closed bed lid, flush with rail) ─────────────── */}
-        <mesh position={[(REAR + CAB_X1) / 2 + 0.02, BED_TOP, 0]} castShadow>
-          <RoundedBox args={[Math.abs(CAB_X1 - REAR) - 0.10, 0.03, TW - 0.10]} radius={0.015} smoothness={3}>
-            <meshStandardMaterial {...bodyMat} />
-          </RoundedBox>
-        </mesh>
-
-        {/* ── Squared fender flares (signature truck cue) ─────────────────── */}
-        {WHEEL_POSITIONS.map((p, i) => (
-            <mesh key={i} position={[p[0], GND + 0.16, p[2] > 0 ? TW / 2 + 0.005 : -(TW / 2 + 0.005)]}>
-              <boxGeometry args={[WR * 2.3, WR * 1.7, 0.07]} />
-              <meshStandardMaterial color={TRIM_BLACK} metalness={0.3} roughness={0.7} />
-            </mesh>
-        ))}
-
-        {/* ── Running boards ──────────────────────────────────────────────── */}
-        {[TW / 2 + 0.03, -(TW / 2 + 0.03)].map((z, i) => (
-            <mesh key={i} position={[-0.05, GND - 0.02, z]}>
-              <boxGeometry args={[1.10, 0.04, 0.09]} />
-              <meshStandardMaterial color={TRIM_BLACK} metalness={0.75} roughness={0.5} />
-            </mesh>
-        ))}
-
-        {/* ── Wheels (5-spoke alloy) — axle along Z, spin about Z ─────────── */}
-        {WHEEL_POSITIONS.map((p, i) => {
-          const outer = p[2] > 0 ? 1 : -1
-          const faceZ = outer * (0.105)
-          return (
-            <group key={i} position={p}>
-              {/* spin group — rotates about the axle (Z) */}
-              <group ref={el => (wheelRefs.current[i] = el)}>
-                {/* Tyre (axis along Z) */}
-                <mesh rotation={[Math.PI / 2, 0, 0]} castShadow>
-                  <cylinderGeometry args={[WR, WR, 0.20, 28]} />
-                  <meshStandardMaterial color="#111827" roughness={0.9} metalness={0.05} />
-                </mesh>
-                {/* Tread blocks around the circumference (XY plane) */}
-                {Array.from({ length: 16 }).map((_, j) => {
-                  const a = (j / 16) * Math.PI * 2
-                  return (
-                    <mesh key={j} position={[Math.cos(a) * WR * 0.99, Math.sin(a) * WR * 0.99, 0]} rotation={[0, 0, a]}>
-                      <boxGeometry args={[0.045, 0.05, 0.205]} />
-                      <meshStandardMaterial color="#1f2937" roughness={1} />
-                    </mesh>
-                  )
-                })}
-                {/* Outer alloy face (rim + spokes + cap) */}
-                <group position={[0, 0, faceZ]}>
-                  {/* Rim disc (axis along Z) */}
-                  <mesh rotation={[Math.PI / 2, 0, 0]}>
-                    <cylinderGeometry args={[WR - 0.03, WR - 0.03, 0.02, 28]} />
-                    <meshStandardMaterial color="#1e293b" metalness={0.6} roughness={0.35} />
-                  </mesh>
-                  {/* 5 spokes radiating in the XY plane */}
-                  {[0, 1, 2, 3, 4].map(j => (
-                    <mesh key={j} rotation={[0, 0, (j / 5) * Math.PI * 2]} position={[0, 0, 0.005 * outer]}>
-                      <boxGeometry args={[WR * 1.3, 0.045, 0.03]} />
-                      <meshStandardMaterial color="#cbd5e1" metalness={0.96} roughness={0.06} />
-                    </mesh>
-                  ))}
-                  {/* Centre cap */}
-                  <mesh rotation={[Math.PI / 2, 0, 0]} position={[0, 0, 0.012 * outer]}>
-                    <cylinderGeometry args={[0.06, 0.06, 0.02, 12]} />
-                    <meshStandardMaterial color="#94a3b8" metalness={0.98} roughness={0.04} />
-                  </mesh>
-                </group>
-              </group>
-            </group>
-          )
-        })}
-
-        {/* ── Full-width front LED bar (Lightning signature) ──────────────── */}
-        <mesh position={[FRONT - 0.005, GND + 0.34, 0]}>
-          <boxGeometry args={[0.04, 0.035, TW + 0.02]} />
-          <meshStandardMaterial color="#e0f2fe" emissive="#e0f2fe" emissiveIntensity={isConnected ? 0.6 : 3.2} />
-        </mesh>
-        {/* Headlight pods */}
-        {[TW / 2 - 0.13, -(TW / 2 - 0.13)].map((z, i) => (
-            <group key={i}>
-              <mesh position={[FRONT - 0.04, GND + 0.26, z]}>
-                <boxGeometry args={[0.05, 0.13, 0.22]} />
-                <meshStandardMaterial color="#fef9c3" emissive="#fef9c3" emissiveIntensity={isConnected ? 0.4 : 2.0} />
-              </mesh>
-              {!isConnected && <pointLight position={[FRONT + 0.15, GND + 0.30, z * 1.6]} color="#fff8dc" intensity={0.8} distance={3.2} />}
-            </group>
-        ))}
-        {/* Sealed EV grille panel */}
-        <mesh position={[FRONT - 0.01, GND + 0.18, 0]}>
-          <boxGeometry args={[0.035, 0.13, TW - 0.18]} />
-          <meshStandardMaterial color="#09111f" metalness={0.6} roughness={0.3} />
-        </mesh>
-        {/* FORD badge bar */}
-        <mesh position={[FRONT + 0.005, GND + 0.18, 0]}>
-          <boxGeometry args={[0.012, 0.04, 0.24]} />
-          <meshStandardMaterial color="#e2e8f0" metalness={0.98} roughness={0.04} />
-        </mesh>
-
-        {/* ── Full-width rear LED bar ──────────────────────────────────────── */}
-        <mesh position={[REAR + 0.005, GND + 0.30, 0]}>
-          <boxGeometry args={[0.035, 0.03, TW + 0.01]} />
-          <meshStandardMaterial color="#ef4444" emissive="#ef4444" emissiveIntensity={1.2} />
-        </mesh>
-
-        {/* ── Charge port (front fender, ahead of front wheel) ─────────────── */}
-        <mesh position={[1.0, GND + 0.30, TW / 2 + 0.01]}>
-          <boxGeometry args={[0.12, 0.10, 0.04]} />
-          <meshStandardMaterial
-              color="#1e293b"
-              emissive={isCharging ? '#38bdf8' : isConnected ? '#94a3b8' : '#111'}
-              emissiveIntensity={isCharging ? 2.5 : 0.22}
-          />
-        </mesh>
-        {isCharging && <pointLight position={[1.0, GND + 0.40, TW / 2 + 0.28]} color="#38bdf8" intensity={2} distance={1.5} />}
-      </group>
   )
 }
 
@@ -606,12 +181,11 @@ function ChargingStation({ state }) {
 }
 
 // ─── CSMS Server ──────────────────────────────────────────────────────────────
-// Ford oval badge — real horizontal ellipse shape via ExtrudeGeometry
-function FordLogo({ position }) {
+function Logo({ position }) {
   const glowRef = useRef()
   const t = useRef(0)
 
-  // Real Ford oval: ~2.2:1 width-to-height ratio
+  // Real oval: ~2.2:1 width-to-height ratio
   const ovalGeom = useMemo(() => {
     const shape = new THREE.Shape()
     shape.absellipse(0, 0, 0.22, 0.12, 0, Math.PI * 2, false, 0)
@@ -646,7 +220,7 @@ function FordLogo({ position }) {
       <mesh geometry={rimGeom}>
         <meshStandardMaterial color="#d1d5db" metalness={0.95} roughness={0.06} />
       </mesh>
-      {/* FORD italic text — renderOrder ensures it draws on top */}
+      {/* italic text — renderOrder ensures it draws on top */}
       <Text
         position={[0, 0, 0.032]}
         fontSize={0.075}
@@ -659,7 +233,7 @@ function FordLogo({ position }) {
         renderOrder={10}
         depthOffset={-2}
       >
-        FORD
+        Yaazh
       </Text>
       <pointLight ref={glowRef} position={[0, 0, 0.9]} color="#3b82f6" distance={3.5} intensity={0.7} />
     </group>
@@ -749,8 +323,8 @@ function CSMSServer({ position = [3.5, 0, 0], scale = 1 }) {
         </mesh>
       ))}
 
-      {/* ── Ford logo on top-floor front wall ─────────────── */}
-      <FordLogo position={[0, (FLOORS - 1) * FLOOR_H + FLOOR_H / 2, BLDG_D / 2 + 0.04]} />
+      {/* ── Logo on top-floor front wall ─────────────── */}
+      <Logo position={[0, (FLOORS - 1) * FLOOR_H + FLOOR_H / 2, BLDG_D / 2 + 0.04]} />
     </group>
   )
 }
@@ -916,19 +490,18 @@ function MessagePacket({ trigger, direction }) {
 const OCCUPIED_MS = 900
 const CHARGING_MS = 5000
 
-function CameraDrift({ zoomOut = false }) {
+function CameraDrift({ zoomOut = false, overrideRef }) {
   const t    = useRef(0)
   const mx   = useRef(0)
   const my   = useRef(0)
-  const pull = useRef(0)   // 0 → 1 dolly-back amount during the launch transition
+  const pull = useRef(0)
   useFrame(({ camera, pointer }, dt) => {
     t.current += dt * 0.12
-    // Smoothly ease toward the pointer for a gentle parallax (low drag)
     const k = 1 - Math.exp(-dt * 4)
     mx.current += (pointer.x - mx.current) * k
     my.current += (pointer.y - my.current) * k
-    // Ease the dolly-back when launching (pull camera up and away)
     pull.current += ((zoomOut ? 1 : 0) - pull.current) * (1 - Math.exp(-dt * 3))
+    if (overrideRef?.current?.enabled) return  // let CameraController handle it
     const p = pull.current
     camera.position.x = 1.5 + Math.sin(t.current) * 1.5 + mx.current * 1.6
     camera.position.y = 3.2 + Math.sin(t.current * 0.7) * 0.4 + my.current * 0.9 + p * 1.6
@@ -957,8 +530,8 @@ function CelestialBody() {
     if (glowRef.current) glowRef.current.material.opacity = 0.9 + Math.sin(t.current * 0.8) * 0.08
   })
 
-  const pos = [5, 11, 14]
-  const r = 1.5
+  const pos = [40, 88, 112]
+  const r = 12
 
   return (
     <group position={pos}>
@@ -1080,14 +653,14 @@ function Cityscape() {
 }
 
 // ─── Inner scene ─────────────────────────────────────────────────────────────
-function Scene({ mode, snapshot, log, zoomOut }) {
+function Scene({ mode, snapshot, log, zoomOut, onInfo, cameraOverrideRef }) {
   const [introPhase, setIntroPhase] = useState('arriving')
   const [carVariant, setCarVariant] = useState(0)
-  const [panelParked, setPanelParked] = useState(false)   // panel: car settled at pad?
+  const [panelParked, setPanelParked] = useState(false)
   const [sendTrig, setSendTrig]     = useState(0)
   const [recvTrig, setRecvTrig]     = useState(0)
   const prevLogLen = useRef(0)
-  const carXRef    = useRef(-7)   // shared live car x — read by cable + particles
+  const carXRef    = useRef(-7)
 
   useEffect(() => {
     if (mode !== 'panel') return
@@ -1125,6 +698,22 @@ function Scene({ mode, snapshot, log, zoomOut }) {
     charging     = introPhase === 'charging'
   }
 
+  // Push debug info to EVScene overlay whenever relevant state changes
+  useEffect(() => {
+    if (!onInfo) return
+    const variant = CAR_VARIANTS[carVariant]
+    onInfo({
+      type:      variant.type,
+      body:      variant.body,
+      variantN:  carVariant,
+      total:     CAR_VARIANTS.length,
+      phase:     mode === 'intro' ? introPhase : '—',
+      evseState: displayState,
+      cable:     cableVisible,
+      charging,
+    })
+  }, [introPhase, carVariant, displayState, cableVisible, charging]) // eslint-disable-line react-hooks/exhaustive-deps
+
   return (
     <>
       {/* Warm daylight: golden sun key + sky fill */}
@@ -1152,7 +741,7 @@ function Scene({ mode, snapshot, log, zoomOut }) {
       <MessagePacket trigger={sendTrig} direction="send" />
       <MessagePacket trigger={recvTrig} direction="recv" />
 
-      {mode === 'intro' && <CameraDrift zoomOut={zoomOut} />}
+      {mode === 'intro' && <CameraDrift zoomOut={zoomOut} overrideRef={cameraOverrideRef} />}
       {mode === 'panel' && (
         <FixedCamera position={[1.3, 1.55, 3.4]} target={[-0.99, 0.55, 0.45]} fov={40} />
       )}
@@ -1170,9 +759,190 @@ function FirstFrame({ onReady }) {
   return null
 }
 
+// ─── Camera tracker — reads live camera state every ~10 frames ────────────────
+function CameraTracker({ onCam }) {
+  const tick = useRef(0)
+  useFrame(({ camera }) => {
+    if (++tick.current % 10 !== 0) return
+    const { x, y, z } = camera.position
+    const hz  = Math.sqrt(x * x + z * z)
+    onCam({
+      x, y, z,
+      fov:  camera.fov,
+      dist: Math.sqrt(x * x + y * y + z * z),
+      az:   Math.atan2(z, x)  * (180 / Math.PI),
+      el:   Math.atan2(y, hz) * (180 / Math.PI),
+    })
+  })
+  return null
+}
+
+// Applies manual override — CameraDrift skips when enabled, so no conflict
+function CameraController({ overrideRef }) {
+  useFrame(({ camera }) => {
+    const o = overrideRef.current
+    if (!o.enabled) return
+    camera.position.set(o.x, o.y, o.z)
+    if (camera.fov !== o.fov) { camera.fov = o.fov; camera.updateProjectionMatrix() }
+    camera.lookAt(o.lx ?? 1.2, 0.8, o.lz ?? 0)
+  })
+  return null
+}
+
+function Row({ label, value, valueColor = '#e2e8f0', dot = false }) {
+  return (
+    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
+      <span style={{ color: '#64748b' }}>{label}</span>
+      <span style={{ display: 'flex', alignItems: 'center', gap: '5px', color: valueColor }}>
+        {dot && (
+          <span style={{
+            display: 'inline-block', width: '6px', height: '6px',
+            borderRadius: '50%', background: valueColor,
+          }} />
+        )}
+        {value}
+      </span>
+    </div>
+  )
+}
+function Divider() {
+  return <div style={{ borderTop: '1px solid rgba(255,255,255,0.07)', margin: '6px 0' }} />
+}
+
 // ─── Public component ─────────────────────────────────────────────────────────
 export default function EVScene({ mode = 'intro', snapshot = {}, log = [], className = '', zoomOut = false }) {
-  const [ready, setReady] = useState(false)
+  const [ready, setReady]   = useState(false)
+  const [info,       setInfo]      = useState(null)
+  const [cam,        setCam]       = useState(null)
+  const [panelOpen,  setPanelOpen] = useState(true)
+
+  // Spherical orbit controls — more intuitive than raw X/Y/Z
+  // Az=azimuth (orbit), El=elevation, Dist=zoom, panX/panZ = strafe offset of lookAt
+  const LOOK_AT = [1.2, 0.8, 0]
+  const toXYZ = (az, el, dist, panX = 0, panZ = 0) => {
+    const azR = az * (Math.PI / 180), elR = el * (Math.PI / 180)
+    const lx = LOOK_AT[0] + panX, lz = LOOK_AT[2] + panZ
+    return {
+      x: lx + dist * Math.cos(elR) * Math.cos(azR),
+      y: LOOK_AT[1] + dist * Math.sin(elR),
+      z: lz + dist * Math.cos(elR) * Math.sin(azR),
+      lx, lz,
+    }
+  }
+  const fromXYZ = (cx, cy, cz, lx = LOOK_AT[0], lz = LOOK_AT[2]) => {
+    const dx = cx - lx, dy = cy - LOOK_AT[1], dz = cz - lz
+    const dist = Math.sqrt(dx*dx + dy*dy + dz*dz)
+    return {
+      dist,
+      el:  parseFloat((Math.atan2(dy, Math.sqrt(dx*dx + dz*dz)) * 180 / Math.PI).toFixed(1)),
+      az:  parseFloat((Math.atan2(dz, dx)                        * 180 / Math.PI).toFixed(1)),
+    }
+  }
+
+  const camOverrideRef  = useRef({ enabled: false, x: 1.5, y: 4.5, z: 10, fov: 50, lx: 1.2, lz: 0 })
+  const [camEdit, setCamEdit] = useState({ enabled: false, az: 88, el: 20, dist: 10.7, fov: 50, panX: 0, panZ: 0 })
+  // Single interval ref at component level — survives re-renders so stopNudge always clears the right one
+  const nudgeIntervalRef = useRef(null)
+
+  const enableOverride = () => {
+    if (camEdit.enabled) return
+    const ref = camOverrideRef.current
+    const lx = ref.lx ?? LOOK_AT[0], lz = ref.lz ?? LOOK_AT[2]
+    const panX = lx - LOOK_AT[0], panZ = lz - LOOK_AT[2]
+    const { az, el, dist } = fromXYZ(cam?.x ?? 1.5, cam?.y ?? 4.5, cam?.z ?? 10, lx, lz)
+    const fov = Math.round(cam?.fov ?? 50)
+    const next = { enabled: true, az, el, dist: parseFloat(dist.toFixed(2)), fov, panX, panZ }
+    const pos = toXYZ(az, el, dist, panX, panZ)
+    camOverrideRef.current = { enabled: true, fov, x: pos.x, y: pos.y, z: pos.z, lx: pos.lx, lz: pos.lz }
+    setCamEdit(next)
+  }
+  const releaseCam = () => {
+    clearInterval(nudgeIntervalRef.current)
+    nudgeIntervalRef.current = null
+    camOverrideRef.current = { ...camOverrideRef.current, enabled: false }
+    setCamEdit(prev => ({ ...prev, enabled: false }))
+  }
+  const handleCamChange = (key, val) => {
+    const next = { ...camEdit, [key]: val, enabled: true }
+    const pos = toXYZ(next.az, next.el, next.dist, next.panX ?? 0, next.panZ ?? 0)
+    camOverrideRef.current = { enabled: true, fov: next.fov, x: pos.x, y: pos.y, z: pos.z, lx: pos.lx, lz: pos.lz }
+    setCamEdit(next)
+    saveConfig(next)
+  }
+  const NUDGE_LIMITS = { az: [-180, 180], el: [2, 80], dist: [2, 22], fov: [15, 90] }
+  const nudgeCam = (key, delta) => {
+    const ref = camOverrideRef.current
+    const lx = ref.lx ?? LOOK_AT[0], lz = ref.lz ?? LOOK_AT[2]
+    const panX = lx - LOOK_AT[0], panZ = lz - LOOK_AT[2]
+    const sph = (ref.enabled && ref.x != null)
+      ? fromXYZ(ref.x, ref.y, ref.z, lx, lz)
+      : fromXYZ(cam?.x ?? 1.5, cam?.y ?? 4.5, cam?.z ?? 10, lx, lz)
+    const fov = ref.fov ?? Math.round(cam?.fov ?? 50)
+    const base = { enabled: true, az: sph.az, el: sph.el, dist: parseFloat(sph.dist.toFixed(2)), fov, panX, panZ }
+    const [mn, mx] = NUDGE_LIMITS[key] ?? [-Infinity, Infinity]
+    const next = { ...base, [key]: Math.max(mn, Math.min(mx, base[key] + delta)) }
+    const pos = toXYZ(next.az, next.el, next.dist, panX, panZ)
+    camOverrideRef.current = { enabled: true, fov: next.fov, x: pos.x, y: pos.y, z: pos.z, lx: pos.lx, lz: pos.lz }
+    setCamEdit(next)
+    saveConfig(next)
+  }
+  // strafeCam: translate camera + lookAt together along the horizontal right vector
+  const strafeCam = (delta) => {
+    const ref = camOverrideRef.current
+    const cx = ref.x ?? cam?.x ?? 1.5, cy = ref.y ?? cam?.y ?? 4.5, cz = ref.z ?? cam?.z ?? 10
+    const lx = ref.lx ?? LOOK_AT[0], lz = ref.lz ?? LOOK_AT[2]
+    const fov = ref.fov ?? Math.round(cam?.fov ?? 50)
+    // right = cross(forward=(lx-cx,0,lz-cz), up=(0,1,0)) = (-fz, 0, fx) / len
+    const fx = lx - cx, fz = lz - cz
+    const len = Math.sqrt(fx*fx + fz*fz) || 1
+    const rx = -fz / len, rz = fx / len
+    const newCx = cx + rx * delta, newCz = cz + rz * delta
+    const newLx = lx + rx * delta, newLz = lz + rz * delta
+    camOverrideRef.current = { enabled: true, x: newCx, y: cy, z: newCz, fov, lx: newLx, lz: newLz }
+    const sph = fromXYZ(newCx, cy, newCz, newLx, newLz)
+    const next = { enabled: true, az: sph.az, el: sph.el, dist: parseFloat(sph.dist.toFixed(2)), fov, panX: newLx - LOOK_AT[0], panZ: newLz - LOOK_AT[2] }
+    setCamEdit(next)
+    saveConfig(next)
+  }
+
+  // Derive live spherical coords from camera tracker output
+  const liveSph = cam ? fromXYZ(cam.x, cam.y, cam.z) : null
+
+  const CAM_DEFAULTS = { az: 88, el: 20, dist: 10.7, fov: 50, panX: 0, panZ: 0 }
+  const STORAGE_KEY  = 'ev-cam-config'
+  const saveConfig = (edit) => {
+    const { az, el, dist, fov, panX, panZ } = edit
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ az, el, dist, fov, panX: panX ?? 0, panZ: panZ ?? 0 })) } catch {}
+  }
+  const resetConfig = () => {
+    try { localStorage.removeItem(STORAGE_KEY) } catch {}
+    const pos = toXYZ(CAM_DEFAULTS.az, CAM_DEFAULTS.el, CAM_DEFAULTS.dist, 0, 0)
+    camOverrideRef.current = { enabled: true, fov: CAM_DEFAULTS.fov, x: pos.x, y: pos.y, z: pos.z, lx: pos.lx, lz: pos.lz }
+    setCamEdit({ ...CAM_DEFAULTS, enabled: true })
+  }
+
+  // Load saved config once on mount
+  useEffect(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? 'null')
+      if (saved && typeof saved.az === 'number') {
+        const { az, el, dist, fov, panX = 0, panZ = 0 } = saved
+        const pos = toXYZ(az, el, dist, panX, panZ)
+        camOverrideRef.current = { enabled: true, fov, x: pos.x, y: pos.y, z: pos.z, lx: pos.lx, lz: pos.lz }
+        setCamEdit({ enabled: true, az, el, dist, fov, panX, panZ })
+      }
+    } catch {}
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const PHASE_COLOR = {
+    arriving: '#60a5fa', occupied: '#fbbf24', charging: '#34d399', leaving: '#a78bfa',
+  }
+  const STATE_COLOR = {
+    Available: '#22c55e', Occupied: '#eab308', Charging: '#38bdf8',
+    Faulted: '#ef4444', Inoperative: '#6b7280',
+  }
+  const TYPE_LABEL = { truck: 'F-150 Lightning', sedan: 'EV Sedan', suv: 'EV SUV', cybertruck: 'Cybertruck' }
+
   return (
     <div className={`relative ${className}`} style={{ height: '100%', background: '#080f1a' }}>
       <Canvas
@@ -1181,11 +951,13 @@ export default function EVScene({ mode = 'intro', snapshot = {}, log = [], class
         style={{ background: '#87ceeb', width: '100%', height: '100%' }}
         gl={{ antialias: true, toneMapping: THREE.ACESFilmicToneMapping, toneMappingExposure: 1.4 }}
       >
-        <Scene mode={mode} snapshot={snapshot} log={log} zoomOut={zoomOut} />
+        <Scene mode={mode} snapshot={snapshot} log={log} zoomOut={zoomOut} onInfo={setInfo} cameraOverrideRef={camOverrideRef} />
+        <CameraTracker onCam={setCam} />
+        <CameraController overrideRef={camOverrideRef} />
         <FirstFrame onReady={() => setReady(true)} />
       </Canvas>
 
-      {/* Load overlay — masks the canvas clear colour until the first frame paints */}
+      {/* Load overlay */}
       <div
         className={`absolute inset-0 flex items-center justify-center transition-opacity duration-500
                     ${ready ? 'opacity-0 pointer-events-none' : 'opacity-100'}`}
@@ -1193,6 +965,129 @@ export default function EVScene({ mode = 'intro', snapshot = {}, log = [], class
       >
         <i className="fa-solid fa-spinner fa-spin text-blue-400 text-3xl" />
       </div>
+
+      {/* ── Config panel ─────────────────────────────────────────────── */}
+      {ready && cam && (
+        <div
+          className="absolute bottom-4 right-4 select-none"
+          style={{
+            background: 'rgba(8,15,26,0.80)',
+            backdropFilter: 'blur(10px)',
+            border: '1px solid rgba(255,255,255,0.10)',
+            borderRadius: '10px',
+            padding: panelOpen ? '10px 14px' : '6px 14px',
+            width: '210px',
+            fontFamily: 'monospace',
+            fontSize: '11px',
+            maxHeight: 'calc(100vh - 2rem)',
+            overflowY: panelOpen ? 'auto' : 'hidden',
+            transition: 'padding 0.15s ease',
+          }}
+        >
+          {/* Header */}
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: panelOpen ? '8px' : '0' }}>
+            <span style={{ color: '#64748b', fontSize: '9px', letterSpacing: '0.12em', textTransform: 'uppercase' }}>Config</span>
+            <span style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+              <button
+                onClick={resetConfig}
+                style={{ background: 'none', border: 'none', color: '#475569', fontSize: '9px', cursor: 'pointer', padding: '0 2px', lineHeight: 1 }}
+                title="Reset to defaults"
+              >⟳ reset</button>
+              <button
+                onClick={() => setPanelOpen(o => !o)}
+                style={{ background: 'none', border: 'none', color: '#64748b', fontSize: '11px', cursor: 'pointer', padding: '0 2px', lineHeight: 1 }}
+                title={panelOpen ? 'Collapse' : 'Expand'}
+              >
+                {panelOpen ? '▾' : '▸'}
+              </button>
+            </span>
+          </div>
+
+          {panelOpen && (<>
+
+          {/* ── Camera — editable ── */}
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+            <span style={{ color: '#64748b', fontSize: '9px', letterSpacing: '0.10em', textTransform: 'uppercase' }}>Camera</span>
+            {camEdit.enabled
+              ? <button onClick={releaseCam} style={{ background: '#1e3a5f', border: '1px solid #3b82f6', borderRadius: '4px', color: '#60a5fa', fontSize: '9px', padding: '1px 6px', cursor: 'pointer' }}>↺ Auto</button>
+              : <span style={{ color: '#374151', fontSize: '9px' }}>drag to override</span>
+            }
+          </div>
+
+          {[
+            { key: 'az',   label: '← Orbit →', min: -180, max: 180, step: 1,   suffix: '°' },
+            { key: 'el',   label: 'Elevation',  min: 2,    max: 80,  step: 0.5, suffix: '°' },
+            { key: 'dist', label: 'Distance',   min: 2,    max: 22,  step: 0.2, suffix: ''  },
+            { key: 'fov',  label: 'FOV',        min: 15,   max: 90,  step: 1,   suffix: '°' },
+          ].map(({ key, label, min, max, step, suffix }) => {
+            const lv  = liveSph?.[key] ?? (cam?.fov && key === 'fov' ? cam.fov : { az:88, el:20, dist:10.7, fov:50 }[key])
+            const val = camEdit.enabled ? camEdit[key] : lv
+            const fmt = v => step < 1 ? Number(v).toFixed(1) : Number(v).toFixed(0)
+            return (
+              <div key={key} style={{ marginBottom: '6px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '2px' }}>
+                  <span style={{ color: '#64748b' }}>{label}</span>
+                  <span style={{ color: camEdit.enabled ? '#e2e8f0' : '#94a3b8' }}>{fmt(val)}{suffix}</span>
+                </div>
+                <input type="range" min={min} max={max} step={step} value={val ?? min}
+                  style={{ width: '100%', accentColor: camEdit.enabled ? '#60a5fa' : '#334155', cursor: 'pointer' }}
+                  onPointerDown={enableOverride}
+                  onChange={e => handleCamChange(key, step < 1 ? parseFloat(e.target.value) : parseInt(e.target.value))}
+                />
+              </div>
+            )
+          })}
+
+          {/* Read-only live position */}
+          {cam && (<>
+            <Divider />
+            {/* D-pad: ◀/▶ strafe (translate), ▲/▼ elevation */}
+            {(() => {
+              const btnStyle = (active) => ({
+                background: active ? '#1e3a5f' : '#0f1f35',
+                border: `1px solid ${active ? '#3b82f6' : 'rgba(255,255,255,0.10)'}`,
+                borderRadius: '5px',
+                color: active ? '#93c5fd' : '#475569',
+                fontSize: '13px',
+                width: '32px', height: '28px',
+                cursor: 'pointer', lineHeight: 1,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                userSelect: 'none',
+              })
+              const startNudge = (fn) => {
+                fn()
+                clearInterval(nudgeIntervalRef.current)
+                nudgeIntervalRef.current = setInterval(fn, 120)
+              }
+              const stopNudge = () => {
+                clearInterval(nudgeIntervalRef.current)
+                nudgeIntervalRef.current = null
+              }
+              const btn = (label, fn) => (
+                <button key={label} style={btnStyle(camEdit.enabled)}
+                  onMouseDown={() => startNudge(fn)} onMouseUp={stopNudge} onMouseLeave={stopNudge}
+                  onTouchStart={e => { e.preventDefault(); startNudge(fn) }} onTouchEnd={stopNudge}
+                >{label}</button>
+              )
+              return (
+                <div style={{ display: 'grid', gridTemplateColumns: '32px 32px 32px', gridTemplateRows: '28px 28px 28px', gap: '4px', margin: '6px auto 4px', width: 'fit-content' }}>
+                  <div />
+                  {btn('▲', () => nudgeCam('el', 5))}
+                  <div />
+                  {btn('◀', () => strafeCam(-0.3))}
+                  <button style={{ ...btnStyle(false), fontSize: '9px', color: '#374151' }} onClick={releaseCam} title="Reset to auto">⊙</button>
+                  {btn('▶', () => strafeCam(0.3))}
+                  <div />
+                  {btn('▼', () => nudgeCam('el', -5))}
+                  <div />
+                </div>
+              )
+            })()}
+          </>)}
+
+          </>)} {/* end panelOpen */}
+        </div>
+      )}
     </div>
   )
 }
